@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ConsoleLogger,
   DefaultDeviceController,
@@ -32,6 +32,42 @@ function tileShowsCamera(tile) {
   return true;
 }
 
+/**
+ * Mounts a <video> element and binds it to a Chime tile.
+ * Using a dedicated component ensures bindVideoElement is called exactly once
+ * per mount, and unbindVideoElement is called on unmount — no race conditions.
+ */
+function VideoTile({ tileId, localTile, session, label, paused }) {
+  const videoRef = useRef(null);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el || !session) return undefined;
+    try {
+      session.audioVideo.bindVideoElement(tileId, el);
+    } catch (err) {
+      console.warn("bindVideoElement failed:", err);
+    }
+    return () => {
+      try {
+        session.audioVideo.unbindVideoElement(tileId);
+      } catch {
+        /* noop */
+      }
+    };
+  }, [tileId, session]);
+
+  return (
+    <div className="video-tile-wrap video-tile-wrap--live">
+      <video ref={videoRef} autoPlay playsInline muted={Boolean(localTile)} />
+      <div className="video-tile-label">
+        {label}
+        {paused ? " · Paused" : ""}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [hostPayload, setHostPayload] = useState(null);
   const [guestCode, setGuestCode] = useState("");
@@ -58,7 +94,7 @@ export default function App() {
   const [localCamOn, setLocalCamOn] = useState(true);
 
   const rosterRef = useRef(new Map());
-  const videoElsRef = useRef({});
+  const audioElRef = useRef(null);
 
   const transcriptRoomCode =
     visitContext?.roomCode ??
@@ -157,14 +193,22 @@ export default function App() {
       }
     );
 
+    // Always pass a deviceId — fall back to "default" so we never silently
+    // skip audio/video even when enumerate returns an empty list (e.g. before
+    // the browser permission prompt resolves).
     const audioInputs = await meetingSession.audioVideo.listAudioInputDevices();
-    if (audioInputs.length > 0) {
-      await meetingSession.audioVideo.startAudioInput(audioInputs[0].deviceId);
-    }
+    const audioDeviceId = audioInputs[0]?.deviceId ?? "default";
+    await meetingSession.audioVideo.startAudioInput(audioDeviceId);
 
     const videoInputs = await meetingSession.audioVideo.listVideoInputDevices();
     if (videoInputs.length > 0) {
       await meetingSession.audioVideo.startVideoInput(videoInputs[0].deviceId);
+    }
+
+    // Bind the audio output element BEFORE start() so remote audio plays
+    // immediately once the session connects.
+    if (audioElRef.current) {
+      await meetingSession.audioVideo.bindAudioElement(audioElRef.current);
     }
 
     meetingSession.audioVideo.start();
@@ -391,27 +435,6 @@ export default function App() {
 
   const remoteOthersCount = Math.max(0, participants.length - 1);
 
-  useLayoutEffect(() => {
-    if (!session) return undefined;
-    const av = session.audioVideo;
-    const tiles = Object.values(videoTiles);
-    tiles.forEach((t) => {
-      const el = videoElsRef.current[t.tileId];
-      if (el && !t.paused && tileShowsCamera(t)) {
-        av.bindVideoElement(t.tileId, el);
-      }
-    });
-    return () => {
-      tiles.forEach((t) => {
-        try {
-          av.unbindVideoElement(t.tileId);
-        } catch {
-          /* noop */
-        }
-      });
-    };
-  }, [session, videoTiles]);
-
   const tileByAttendeeId = useMemo(() => {
     const m = new Map();
     for (const t of Object.values(videoTiles)) {
@@ -528,6 +551,8 @@ export default function App() {
 
   return (
     <div className={`app-shell ${inCall ? "app-shell--meeting" : ""}`}>
+      {/* Hidden audio sink — Chime routes all remote audio here */}
+      <audio ref={audioElRef} autoPlay style={{ display: "none" }} />
       {inCall ? (
         <header className="meeting-topbar">
           <div className="meeting-topbar__left">
@@ -693,21 +718,13 @@ export default function App() {
                     role="listitem"
                   >
                     {live && tile ? (
-                      <div className="video-tile-wrap video-tile-wrap--live">
-                        <video
-                          autoPlay
-                          playsInline
-                          muted={Boolean(tile.localTile)}
-                          ref={(el) => {
-                            if (el) videoElsRef.current[tile.tileId] = el;
-                            else delete videoElsRef.current[tile.tileId];
-                          }}
-                        />
-                        <div className="video-tile-label">
-                          {videoLabelForParticipant(p)}
-                          {tile.paused ? " · Paused" : ""}
-                        </div>
-                      </div>
+                      <VideoTile
+                        tileId={tile.tileId}
+                        localTile={tile.localTile}
+                        session={session}
+                        label={videoLabelForParticipant(p)}
+                        paused={tile.paused}
+                      />
                     ) : (
                       <div className="video-placeholder">
                         <div className="video-placeholder__avatar">
