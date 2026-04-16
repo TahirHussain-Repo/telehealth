@@ -349,6 +349,8 @@ export default function App() {
   const recordedChunksRef = useRef([]);
   const localMicStreamRef = useRef(null);
   const ffmpegRef = useRef(null);
+  const recordingDestRef = useRef(null);       // AudioContext destination node
+  const lateRemoteConnectRef = useRef(null);   // cleanup handle for lazy remote-audio hookup
   const prejoinStreamRef = useRef(null);
 
   const roomCode = visitContext?.roomCode ?? hostPayload?.roomCode ?? null;
@@ -578,7 +580,23 @@ export default function App() {
       const audioCtx = new AudioContext();
       audioCtxRef.current = audioCtx;
       const dest = audioCtx.createMediaStreamDestination();
-      if (remoteStream) audioCtx.createMediaStreamSource(remoteStream).connect(dest);
+      recordingDestRef.current = dest;
+
+      // Connect remote audio only if the stream already has tracks (patient already in call).
+      // When the doctor joins first, the audio element has no tracks yet — hook up lazily.
+      if (remoteStream?.getAudioTracks().length > 0) {
+        audioCtx.createMediaStreamSource(remoteStream).connect(dest);
+      } else {
+        const connectLate = () => {
+          const stream = audioElRef.current?.captureStream?.();
+          if (!stream || stream.getAudioTracks().length === 0) return;
+          try { audioCtx.createMediaStreamSource(stream).connect(dest); } catch (e) { console.warn("remote audio connect:", e); }
+          audioElRef.current?.removeEventListener("play", connectLate);
+          lateRemoteConnectRef.current = null;
+        };
+        audioElRef.current?.addEventListener("play", connectLate);
+        lateRemoteConnectRef.current = connectLate;
+      }
       audioCtx.createMediaStreamSource(localStream).connect(dest);
 
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -611,9 +629,14 @@ export default function App() {
     if (rec && rec.state !== "inactive") rec.stop();
     audioCtxRef.current?.close();
     localMicStreamRef.current?.getTracks().forEach((t) => t.stop());
+    if (lateRemoteConnectRef.current) {
+      audioElRef.current?.removeEventListener("play", lateRemoteConnectRef.current);
+      lateRemoteConnectRef.current = null;
+    }
     mediaRecorderRef.current = null;
     audioCtxRef.current = null;
     localMicStreamRef.current = null;
+    recordingDestRef.current = null;
     setRecording(false);
   };
 
