@@ -371,13 +371,21 @@ export default function App() {
   // ── Patient: poll knock status while waiting ────────────────────────────
   useEffect(() => {
     if (screen !== "waiting" || !knockId) return undefined;
+    let cancelled = false;
     const poll = async () => {
+      if (cancelled) return;
       try {
         const res = await fetch(`${API_URL}/api/meeting/knock/${knockId}`);
+        if (cancelled) return;
         const data = await res.json();
+        if (cancelled) return;
         if (data.status === "admitted") {
+          cancelled = true;
+          clearInterval(id);
           setAdmittedData(data);
         } else if (data.status === "denied") {
+          cancelled = true;
+          clearInterval(id);
           stopPrejoinStream();
           setKnockId(null);
           setScreen("lobby");
@@ -389,7 +397,7 @@ export default function App() {
     };
     poll();
     const id = setInterval(poll, 2000);
-    return () => clearInterval(id);
+    return () => { cancelled = true; clearInterval(id); };
   }, [screen, knockId]);
 
   // ── Patient: join when admitted ─────────────────────────────────────────
