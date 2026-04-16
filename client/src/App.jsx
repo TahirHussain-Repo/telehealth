@@ -727,7 +727,16 @@ export default function App() {
     };
 
     meetingSession.audioVideo.addObserver({
-      audioVideoDidStart: () => setMediaConnected(true),
+      audioVideoDidStart: () => {
+        setMediaConnected(true);
+        // Start local camera here — session is fully ready at this point.
+        // Calling startLocalVideoTile() immediately after audioVideo.start()
+        // is a race condition; the tile silently fails if the session isn't
+        // yet negotiated.
+        if (!meta.initialCamOff) {
+          meetingSession.audioVideo.startLocalVideoTile();
+        }
+      },
       audioVideoDidStop: () => {
         setMediaConnected(false);
         rosterRef.current = new Map();
@@ -736,10 +745,11 @@ export default function App() {
       },
       videoTileDidUpdate: (tileState) => {
         if (!tileState.tileId || tileState.isContent) return;
-        if (!tileState.boundAttendeeId) {
-          setVideoTiles((prev) => { const n = { ...prev }; delete n[tileState.tileId]; return n; });
-          return;
-        }
+        // Tiles can fire before they are bound to an attendee (e.g. during
+        // negotiation). Skip — but do NOT delete existing bound tile state,
+        // because that would briefly unmount the VideoTile component and break
+        // the bindVideoElement → video element connection.
+        if (!tileState.boundAttendeeId) return;
         setVideoTiles((prev) => ({
           ...prev,
           [tileState.tileId]: {
@@ -783,10 +793,6 @@ export default function App() {
     }
 
     meetingSession.audioVideo.start();
-
-    if (!meta.initialCamOff) {
-      meetingSession.audioVideo.startLocalVideoTile();
-    }
 
     if (meta.initialMuted) {
       meetingSession.audioVideo.realtimeMuteLocalAudio();

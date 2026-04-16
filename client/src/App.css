@@ -1554,28 +1554,44 @@ button.btn-danger {
     padding: 6px 10px;
   }
 
-  /* ── In-call video: 1-column stack ── */
-  .video-gallery {
-    grid-template-columns: 1fr;
+  /* ── In-call workspace: tighter on mobile to max video space ── */
+  .meeting-workspace {
+    padding: 8px 10px;
+    gap: 8px;
   }
 
-  /* ── In-call toolbar: equal-width buttons across row ── */
+  .meeting-main {
+    gap: 8px;
+  }
+
+  /* ── In-call video: 1-column stack, tighter gap ── */
+  .video-gallery {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  /* ── In-call toolbar: equal-width buttons across row, compact ── */
   .meeting-toolbar {
     gap: 8px;
-    padding: 10px 12px;
+    padding: 8px 10px;
     border-radius: 10px;
   }
 
   .meeting-toolbar .toolbar-btn {
     min-width: 0;
     flex: 1;
-    padding: 10px 6px;
+    padding: 9px 6px;
     font-size: 0.8rem;
   }
 
   /* ── Hide recording sidebar on mobile (recording still runs) ── */
   .meeting-sidebar {
     display: none;
+  }
+
+  /* ── Ensure each stacked tile has a minimum height ── */
+  .video-cell {
+    min-height: 160px;
   }
 
   /* ── Pre-join / waiting room: stack preview above settings ── */
