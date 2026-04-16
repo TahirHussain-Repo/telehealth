@@ -1084,13 +1084,15 @@ export default function App() {
               <div>
                 <div className="meeting-topbar__title">Telehealth appointment</div>
                 <div className="meeting-topbar__meta">
-                  <span className="mono-id">{roomCode}</span>
-                  <span className="meeting-topbar__sep">·</span>
+                  <span className="meeting-topbar__id-group">
+                    <span className="mono-id">{roomCode}</span>
+                    <span className="meeting-topbar__sep">·</span>
+                  </span>
                   <span>{mediaConnected ? "Connected" : "Connecting…"}</span>
                   <span className="meeting-topbar__sep">·</span>
                   <span>
                     {remoteOthersCount > 0
-                      ? remoteOthersCount === 1 ? "1 other participant" : `${remoteOthersCount} other participants`
+                      ? remoteOthersCount === 1 ? "1 other" : `${remoteOthersCount} others`
                       : "Waiting for others"}
                   </span>
                 </div>
