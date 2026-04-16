@@ -967,3 +967,172 @@ button.btn-danger {
   color: var(--text);
   font-size: 0.9rem;
 }
+
+/* ─── Recording sidebar (in-call) ──────────────────────────────────────── */
+
+.rec-status-panel {
+  padding: 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.rec-status-panel__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.rec-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-h);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 12px;
+}
+
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text);
+  flex-shrink: 0;
+}
+
+.rec-dot--live {
+  background: #ef4444;
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+
+.rec-timer {
+  font-size: 1rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-h);
+  letter-spacing: 0.04em;
+}
+
+.rec-status-panel__hint {
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.rec-error {
+  font-size: 0.82rem;
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+/* ─── Post-call recording panel ────────────────────────────────────────── */
+
+.recording-panel {
+  padding: 32px 20px 48px;
+  display: flex;
+  justify-content: center;
+}
+
+.recording-panel__inner {
+  width: 100%;
+  max-width: 600px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px 28px 24px;
+}
+
+.recording-panel__head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.recording-panel__title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.recording-panel__meta {
+  font-size: 0.8rem;
+  color: var(--text);
+  font-family: var(--font-mono, monospace);
+}
+
+.recording-player {
+  width: 100%;
+  border-radius: 10px;
+  accent-color: var(--accent);
+}
+
+.recording-downloads {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recording-downloads__label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0;
+}
+
+.recording-downloads__btns {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dl-btn {
+  padding: 9px 20px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2, var(--surface));
+  color: var(--text-h);
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+  min-width: 72px;
+  text-align: center;
+}
+
+.dl-btn:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.dl-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.recording-converting-hint {
+  font-size: 0.82rem;
+  color: var(--text);
+  text-align: center;
+  padding: 4px 0;
+  margin: 0;
+}

@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import {
   ConsoleLogger,
   DefaultDeviceController,
@@ -8,7 +10,14 @@ import {
 } from "amazon-chime-sdk-js";
 import "./App.css";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000";
+const API_URL =
+  import.meta.env.MODE === "development"
+    ? import.meta.env.VITE_API_URL || "http://localhost:4000"
+    : "";
+
+/** CDN base for FFmpeg WASM — loaded lazily on first conversion request. */
+const FFMPEG_CORE_BASE =
+  "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
 
 function displayNameFromExternal(ext) {
   if (!ext) return "Participant";
@@ -19,23 +28,25 @@ function displayNameFromExternal(ext) {
 
 function initialsFromDisplayName(name) {
   const parts = name.replace(/\s*\(you\)\s*/i, "").trim().split(/\s+/);
-  if (parts.length >= 2) {
-    return (parts[0][0] + parts[1][0]).toUpperCase();
-  }
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
   return (parts[0]?.[0] ?? "?").toUpperCase();
 }
 
-/** Tile has video we can bind (Chime may set `active` loosely; prefer !paused). */
 function tileShowsCamera(tile) {
   if (!tile?.tileId) return false;
   if (tile.paused) return false;
   return true;
 }
 
+function formatDuration(secs) {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 /**
  * Mounts a <video> element and binds it to a Chime tile.
- * Using a dedicated component ensures bindVideoElement is called exactly once
- * per mount, and unbindVideoElement is called on unmount — no race conditions.
+ * Each instance manages its own bind/unbind lifecycle.
  */
 function VideoTile({ tileId, localTile, session, label, paused }) {
   const videoRef = useRef(null);
@@ -69,56 +80,238 @@ function VideoTile({ tileId, localTile, session, label, paused }) {
 }
 
 export default function App() {
+  // ── Call state ──────────────────────────────────────────────────────────
   const [hostPayload, setHostPayload] = useState(null);
   const [guestCode, setGuestCode] = useState("");
   const [session, setSession] = useState(null);
   const [busy, setBusy] = useState(false);
-
   const [mediaConnected, setMediaConnected] = useState(false);
-  /** Roster synced from Chime presence (both browsers see the same list). */
   const [participants, setParticipants] = useState([]);
-  /** tileId -> tile info for gallery binding */
   const [videoTiles, setVideoTiles] = useState({});
   const [visitContext, setVisitContext] = useState(null);
-  const [transcriptLines, setTranscriptLines] = useState([]);
-  const [medicalNote, setMedicalNote] = useState(null);
-  const [summarizing, setSummarizing] = useState(false);
-  const [sttError, setSttError] = useState(null);
-  /** Lets the patient keep viewing transcript / note after leaving the call. */
-  const [guestRoomAfterLeave, setGuestRoomAfterLeave] = useState(null);
-
-  /** Single-device testing: which role the mic is attributed to in the transcript. */
-  const [transcriptMicAs, setTranscriptMicAs] = useState("doctor");
-  const transcriptMicAsRef = useRef("doctor");
   const [micMuted, setMicMuted] = useState(false);
   const [localCamOn, setLocalCamOn] = useState(true);
 
+  // ── Recording state ──────────────────────────────────────────────────────
+  const [recording, setRecording] = useState(false);
+  const [recordedBlob, setRecordedBlob] = useState(null);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [recordingUrl, setRecordingUrl] = useState(null);
+  const [recordingError, setRecordingError] = useState(null);
+  const [convertingFormat, setConvertingFormat] = useState(null);
+  const [ffmpegLoading, setFfmpegLoading] = useState(false);
+
+  // ── Refs ─────────────────────────────────────────────────────────────────
   const rosterRef = useRef(new Map());
   const audioElRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
+  const localMicStreamRef = useRef(null);
+  const ffmpegRef = useRef(null);
 
-  const transcriptRoomCode =
-    visitContext?.roomCode ??
-    hostPayload?.roomCode ??
-    guestRoomAfterLeave ??
-    null;
+  // ── Room code (for display only) ─────────────────────────────────────────
+  const roomCode = visitContext?.roomCode ?? hostPayload?.roomCode ?? null;
+
+  // ── Blob URL lifecycle ───────────────────────────────────────────────────
+  useEffect(() => {
+    if (!recordedBlob) {
+      setRecordingUrl(null);
+      return undefined;
+    }
+    const url = URL.createObjectURL(recordedBlob);
+    setRecordingUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [recordedBlob]);
+
+  // ── Recording duration timer ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!recording) {
+      setRecordingDuration(0);
+      return undefined;
+    }
+    const t0 = Date.now();
+    const id = setInterval(
+      () => setRecordingDuration(Math.floor((Date.now() - t0) / 1000)),
+      1000
+    );
+    return () => clearInterval(id);
+  }, [recording]);
+
+  // ── Recording ────────────────────────────────────────────────────────────
+
+  const startRecording = async () => {
+    try {
+      // Capture remote audio directly from the Chime <audio> sink element.
+      // captureStream() is supported in Chrome, Firefox, Edge (not Safari).
+      const remoteStream = audioElRef.current?.captureStream?.();
+
+      // Open a second mic stream for local audio. Chrome correctly routes
+      // both calls to the same physical device without conflict.
+      const localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+        video: false,
+      });
+      localMicStreamRef.current = localStream;
+
+      // Mix both streams into a single AudioContext destination.
+      const audioCtx = new AudioContext();
+      audioCtxRef.current = audioCtx;
+      const dest = audioCtx.createMediaStreamDestination();
+
+      if (remoteStream) {
+        audioCtx.createMediaStreamSource(remoteStream).connect(dest);
+      }
+      audioCtx.createMediaStreamSource(localStream).connect(dest);
+
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : null;
+
+      if (!mimeType) {
+        setRecordingError(
+          "Recording is not supported in this browser. Use Chrome or Edge."
+        );
+        return;
+      }
+
+      const recorder = new MediaRecorder(dest.stream, { mimeType });
+      recordedChunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, {
+          type: "audio/webm",
+        });
+        setRecordedBlob(blob);
+      };
+
+      // Collect a chunk every second so we get data even on short calls.
+      recorder.start(1000);
+      mediaRecorderRef.current = recorder;
+      setRecording(true);
+      setRecordingError(null);
+    } catch (err) {
+      console.error("startRecording:", err);
+      setRecordingError(`Could not start recording: ${err.message}`);
+    }
+  };
+
+  const stopRecording = () => {
+    const rec = mediaRecorderRef.current;
+    if (rec && rec.state !== "inactive") rec.stop();
+    audioCtxRef.current?.close();
+    localMicStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaRecorderRef.current = null;
+    audioCtxRef.current = null;
+    localMicStreamRef.current = null;
+    setRecording(false);
+  };
+
+  // ── FFmpeg / Download ─────────────────────────────────────────────────────
+
+  const loadFFmpeg = async () => {
+    if (ffmpegRef.current?.loaded) return ffmpegRef.current;
+    setFfmpegLoading(true);
+    try {
+      const ff = new FFmpeg();
+      await ff.load({
+        coreURL: await toBlobURL(
+          `${FFMPEG_CORE_BASE}/ffmpeg-core.js`,
+          "text/javascript"
+        ),
+        wasmURL: await toBlobURL(
+          `${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`,
+          "application/wasm"
+        ),
+      });
+      ffmpegRef.current = ff;
+      return ff;
+    } finally {
+      setFfmpegLoading(false);
+    }
+  };
+
+  const triggerDownload = (blob, filename) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadAs = async (format) => {
+    if (!recordedBlob) return;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+
+    if (format === "webm") {
+      triggerDownload(recordedBlob, `call-${stamp}.webm`);
+      return;
+    }
+
+    setConvertingFormat(format);
+    try {
+      const ff = await loadFFmpeg();
+
+      await ff.writeFile("input.webm", await fetchFile(recordedBlob));
+
+      if (format === "mp3") {
+        await ff.exec(["-i", "input.webm", "-vn", "-b:a", "128k", "output.mp3"]);
+        const data = await ff.readFile("output.mp3");
+        triggerDownload(
+          new Blob([data.buffer], { type: "audio/mpeg" }),
+          `call-${stamp}.mp3`
+        );
+        await ff.deleteFile("output.mp3");
+      } else if (format === "mp4") {
+        await ff.exec([
+          "-i", "input.webm",
+          "-vn", "-c:a", "aac", "-b:a", "128k",
+          "output.mp4",
+        ]);
+        const data = await ff.readFile("output.mp4");
+        triggerDownload(
+          new Blob([data.buffer], { type: "audio/mp4" }),
+          `call-${stamp}.mp4`
+        );
+        await ff.deleteFile("output.mp4");
+      }
+
+      await ff.deleteFile("input.webm");
+    } catch (err) {
+      console.error("Conversion failed:", err);
+      alert(
+        `Could not convert to ${format.toUpperCase()}. Download the WebM file and convert locally if needed.`
+      );
+    } finally {
+      setConvertingFormat(null);
+    }
+  };
+
+  // ── Chime session ────────────────────────────────────────────────────────
 
   const connectChime = async (meeting, attendee, meta) => {
+    // Clear any previous recording before a new call.
+    setRecordedBlob(null);
+    setRecordingError(null);
     rosterRef.current = new Map();
     setParticipants([]);
     setVideoTiles({});
     setMediaConnected(false);
-    setSttError(null);
     setLocalCamOn(true);
 
     const logger = new ConsoleLogger("ChimeLogs", LogLevel.INFO);
     const deviceController = new DefaultDeviceController(logger);
     const config = new MeetingSessionConfiguration(meeting, attendee);
-
-    const meetingSession = new DefaultMeetingSession(
-      config,
-      logger,
-      deviceController
-    );
+    const meetingSession = new DefaultMeetingSession(config, logger, deviceController);
 
     const myId = attendee.AttendeeId;
 
@@ -131,11 +324,7 @@ export default function App() {
       }));
       remotes.sort((a, b) => a.displayName.localeCompare(b.displayName));
       setParticipants([
-        {
-          attendeeId: myId,
-          displayName: `${localLabel} (you)`,
-          isSelf: true,
-        },
+        { attendeeId: myId, displayName: `${localLabel} (you)`, isSelf: true },
         ...remotes,
       ]);
     };
@@ -183,9 +372,7 @@ export default function App() {
       (attendeeId, present, externalUserId) => {
         if (attendeeId === myId) return;
         if (present) {
-          rosterRef.current.set(attendeeId, {
-            externalUserId: externalUserId || "",
-          });
+          rosterRef.current.set(attendeeId, { externalUserId: externalUserId || "" });
         } else {
           rosterRef.current.delete(attendeeId);
         }
@@ -193,9 +380,6 @@ export default function App() {
       }
     );
 
-    // Always pass a deviceId — fall back to "default" so we never silently
-    // skip audio/video even when enumerate returns an empty list (e.g. before
-    // the browser permission prompt resolves).
     const audioInputs = await meetingSession.audioVideo.listAudioInputDevices();
     const audioDeviceId = audioInputs[0]?.deviceId ?? "default";
     await meetingSession.audioVideo.startAudioInput(audioDeviceId);
@@ -205,8 +389,6 @@ export default function App() {
       await meetingSession.audioVideo.startVideoInput(videoInputs[0].deviceId);
     }
 
-    // Bind the audio output element BEFORE start() so remote audio plays
-    // immediately once the session connects.
     if (audioElRef.current) {
       await meetingSession.audioVideo.bindAudioElement(audioElRef.current);
     }
@@ -215,27 +397,29 @@ export default function App() {
     meetingSession.audioVideo.startLocalVideoTile();
 
     meetingSession.audioVideo.realtimeSubscribeToMuteAndUnmuteLocalAudio(
-      (muted) => {
-        setMicMuted(muted);
-      }
+      (muted) => setMicMuted(muted)
     );
     setMicMuted(meetingSession.audioVideo.realtimeIsLocalAudioMuted());
 
     syncRosterToState();
-    const role = meta.role === "doctor" ? "doctor" : "patient";
-    setTranscriptMicAs(role);
-    transcriptMicAsRef.current = role;
     setVisitContext({ roomCode: meta.roomCode, role: meta.role });
     setSession(meetingSession);
+
+    // Start recording after the session is fully wired up.
+    await startRecording();
   };
 
   const startVisitAsDoctor = async () => {
     setBusy(true);
-    setMedicalNote(null);
-    setGuestRoomAfterLeave(null);
     try {
       const res = await fetch(`${API_URL}/api/meeting`, { method: "POST" });
-      const data = await res.json();
+      const raw = await res.text();
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        throw new Error(`Non-JSON from /api/meeting: ${raw.slice(0, 300)}`);
+      }
       if (!res.ok) throw new Error(data.error || "Could not start visit");
       setHostPayload({
         roomCode: data.roomCode,
@@ -273,8 +457,6 @@ export default function App() {
       return;
     }
     setBusy(true);
-    setMedicalNote(null);
-    setGuestRoomAfterLeave(null);
     try {
       const res = await fetch(`${API_URL}/api/meeting/join`, {
         method: "POST",
@@ -296,9 +478,7 @@ export default function App() {
   };
 
   const leave = async () => {
-    if (visitContext?.role === "patient") {
-      setGuestRoomAfterLeave(visitContext.roomCode);
-    }
+    stopRecording();
     if (session) {
       session.audioVideo.stopLocalVideoTile();
       session.audioVideo.stop();
@@ -309,8 +489,6 @@ export default function App() {
     rosterRef.current = new Map();
     setParticipants([]);
     setVideoTiles({});
-    setTranscriptMicAs("doctor");
-    transcriptMicAsRef.current = "doctor";
     setMicMuted(false);
     setLocalCamOn(true);
   };
@@ -337,101 +515,7 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    transcriptMicAsRef.current = transcriptMicAs;
-  }, [transcriptMicAs]);
-
-  useEffect(() => {
-    if (!visitContext?.roomCode) return undefined;
-
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setSttError(
-        "This browser does not support speech-to-text. Use Chrome or Edge on desktop for live transcription."
-      );
-      return undefined;
-    }
-
-    const rec = new SpeechRecognition();
-    rec.lang = "en-US";
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
-
-    let stopped = false;
-
-    rec.onresult = (event) => {
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        if (!event.results[i].isFinal) continue;
-        const text = event.results[i][0].transcript.trim();
-        if (!text) continue;
-        fetch(`${API_URL}/api/transcript`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            roomCode: visitContext.roomCode,
-            speaker: transcriptMicAsRef.current,
-            text,
-          }),
-        }).catch((err) => console.error("transcript post", err));
-      }
-    };
-
-    rec.onerror = (ev) => {
-      if (ev.error === "not-allowed") {
-        setSttError("Microphone permission denied — transcription needs mic access.");
-      } else if (ev.error !== "no-speech" && ev.error !== "aborted") {
-        console.warn("SpeechRecognition:", ev.error);
-      }
-    };
-
-    rec.onend = () => {
-      if (!stopped) {
-        try {
-          rec.start();
-        } catch {
-          /* ignore */
-        }
-      }
-    };
-
-    try {
-      rec.start();
-    } catch (e) {
-      setSttError(e.message || "Could not start speech recognition");
-    }
-
-    return () => {
-      stopped = true;
-      rec.onend = null;
-      try {
-        rec.stop();
-      } catch {
-        /* ignore */
-      }
-    };
-  }, [visitContext]);
-
-  useEffect(() => {
-    if (!transcriptRoomCode) {
-      setTranscriptLines([]);
-      return undefined;
-    }
-
-    const load = () => {
-      fetch(`${API_URL}/api/meeting/${transcriptRoomCode}/transcript`)
-        .then((r) => r.json())
-        .then((data) => {
-          if (Array.isArray(data.lines)) setTranscriptLines(data.lines);
-        })
-        .catch(console.error);
-    };
-
-    load();
-    const id = setInterval(load, 2000);
-    return () => clearInterval(id);
-  }, [transcriptRoomCode]);
+  // ── Derived ──────────────────────────────────────────────────────────────
 
   const remoteOthersCount = Math.max(0, participants.length - 1);
 
@@ -453,20 +537,17 @@ export default function App() {
   };
 
   const copyMeetingId = async () => {
-    const code = transcriptRoomCode;
-    if (!code) return;
+    if (!roomCode) return;
     try {
-      await navigator.clipboard.writeText(code);
+      await navigator.clipboard.writeText(roomCode);
     } catch {
-      prompt("Meeting ID:", code);
+      prompt("Meeting ID:", roomCode);
     }
   };
 
   const videoLabelForParticipant = (p) => {
     if (p.isSelf) {
-      return visitContext?.role === "doctor"
-        ? "Clinician (you)"
-        : "Patient (you)";
+      return visitContext?.role === "doctor" ? "Clinician (you)" : "Patient (you)";
     }
     return p.displayName;
   };
@@ -478,81 +559,17 @@ export default function App() {
     return tileShowsCamera(tile);
   };
 
-  const generateNote = async () => {
-    const rc = transcriptRoomCode;
-    if (!rc) return;
-    setSummarizing(true);
-    setMedicalNote(null);
-    try {
-      const res = await fetch(`${API_URL}/api/meeting/${rc}/summarize`, {
-        method: "POST",
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Could not generate note");
-      setMedicalNote(data.note);
-    } catch (e) {
-      console.error(e);
-      alert(e.message || "Summarization failed");
-    } finally {
-      setSummarizing(false);
-    }
-  };
-
   const inCall = Boolean(session);
+  const isConverting = Boolean(convertingFormat);
 
-  const visitRecordInner = (
-    <>
-      <h2 id="record-heading-title" className="record-heading-inline">
-        Visit record
-      </h2>
-      <p className="record-meta">
-        Meeting <code>{transcriptRoomCode}</code>
-      </p>
-
-      <div className="transcript-box" aria-live="polite">
-        {transcriptLines.length === 0 ? (
-          <span className="empty-hint">
-            No lines yet—speak during the visit. On one device, use Clinician /
-            Patient to label who is talking.
-          </span>
-        ) : (
-          transcriptLines.map((line, i) => (
-            <div key={`${line.at}-${i}`} className="transcript-line">
-              <span
-                className={`who ${line.speaker === "doctor" ? "doc" : "pt"}`}
-              >
-                {line.speaker === "doctor" ? "Clinician" : "Patient"}:
-              </span>
-              {line.text}
-            </div>
-          ))
-        )}
-      </div>
-
-      <div className="btn-row record-actions">
-        <button
-          type="button"
-          className="primary"
-          onClick={generateNote}
-          disabled={summarizing || transcriptLines.length === 0}
-        >
-          {summarizing ? "Generating note…" : "Draft medical note"}
-        </button>
-      </div>
-
-      {medicalNote && (
-        <>
-          <h3 className="note-heading">Draft note (for review only)</h3>
-          <div className="note-box">{medicalNote}</div>
-        </>
-      )}
-    </>
-  );
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
     <div className={`app-shell ${inCall ? "app-shell--meeting" : ""}`}>
-      {/* Hidden audio sink — Chime routes all remote audio here */}
+      {/* Hidden audio sink — Chime routes all remote audio through this element */}
       <audio ref={audioElRef} autoPlay style={{ display: "none" }} />
+
+      {/* ── Top bar / Lobby ── */}
       {inCall ? (
         <header className="meeting-topbar">
           <div className="meeting-topbar__left">
@@ -560,7 +577,7 @@ export default function App() {
             <div>
               <div className="meeting-topbar__title">Telehealth appointment</div>
               <div className="meeting-topbar__meta">
-                <span className="mono-id">{transcriptRoomCode}</span>
+                <span className="mono-id">{roomCode}</span>
                 <span className="meeting-topbar__sep">·</span>
                 <span>{mediaConnected ? "Connected" : "Connecting…"}</span>
                 <span className="meeting-topbar__sep">·</span>
@@ -704,6 +721,7 @@ export default function App() {
         </div>
       )}
 
+      {/* ── In-call workspace ── */}
       {inCall && (
         <div className="meeting-workspace">
           <div className="meeting-main">
@@ -776,62 +794,90 @@ export default function App() {
             </div>
           </div>
 
-          <aside className="meeting-sidebar" aria-label="Documentation">
-            <div className="transcript-speaker-panel transcript-speaker-panel--compact">
-              <p className="transcript-speaker-panel__title">
-                Transcript speaker (single device)
-              </p>
-              <p className="transcript-speaker-panel__hint">
-                Who should your mic count as for this visit record?
-              </p>
-              <div
-                className="segmented"
-                role="group"
-                aria-label="Attribute speech to role"
-              >
-                <button
-                  type="button"
-                  data-speaker="doctor"
-                  aria-pressed={transcriptMicAs === "doctor"}
-                  onClick={() => setTranscriptMicAs("doctor")}
-                >
-                  Clinician
-                </button>
-                <button
-                  type="button"
-                  data-speaker="patient"
-                  aria-pressed={transcriptMicAs === "patient"}
-                  onClick={() => setTranscriptMicAs("patient")}
-                >
-                  Patient
-                </button>
+          {/* ── Recording sidebar ── */}
+          <aside className="meeting-sidebar" aria-label="Recording status">
+            <div className="rec-status-panel">
+              <div className="rec-status-panel__header">
+                <span className="rec-badge">
+                  <span className={`rec-dot ${recording ? "rec-dot--live" : ""}`} />
+                  {recording ? "Recording" : "Initialising…"}
+                </span>
+                {recording && (
+                  <span className="rec-timer">{formatDuration(recordingDuration)}</span>
+                )}
               </div>
+              <p className="rec-status-panel__hint">
+                Both voices are captured automatically. The recording will be
+                available for playback and download after you leave.
+              </p>
+              {recordingError && (
+                <p className="rec-error" role="alert">{recordingError}</p>
+              )}
             </div>
-
-            {transcriptRoomCode && (
-              <section
-                className="record-section record-section--sidebar"
-                aria-labelledby="record-heading-title"
-              >
-                {visitRecordInner}
-              </section>
-            )}
           </aside>
         </div>
       )}
 
-      {sttError && (
-        <p className="stt-warning" role="alert">
-          {sttError}
-        </p>
-      )}
+      {/* ── Post-call recording playback ── */}
+      {!inCall && recordedBlob && (
+        <section className="recording-panel" aria-label="Call recording">
+          <div className="recording-panel__inner">
+            <div className="recording-panel__head">
+              <h2 className="recording-panel__title">Call recording</h2>
+              {roomCode && (
+                <span className="recording-panel__meta">Meeting {roomCode}</span>
+              )}
+            </div>
 
-      {!inCall && transcriptRoomCode && (
-        <section
-          className="record-section"
-          aria-labelledby="record-heading-title"
-        >
-          {visitRecordInner}
+            <audio
+              controls
+              src={recordingUrl}
+              className="recording-player"
+              aria-label="Recorded call audio"
+            />
+
+            <div className="recording-downloads">
+              <p className="recording-downloads__label">Download as:</p>
+              <div className="recording-downloads__btns">
+                <button
+                  type="button"
+                  className="dl-btn"
+                  onClick={() => downloadAs("webm")}
+                  disabled={isConverting}
+                >
+                  WebM
+                </button>
+                <button
+                  type="button"
+                  className="dl-btn"
+                  onClick={() => downloadAs("mp3")}
+                  disabled={isConverting}
+                >
+                  {convertingFormat === "mp3"
+                    ? "Converting…"
+                    : "MP3"}
+                </button>
+                <button
+                  type="button"
+                  className="dl-btn"
+                  onClick={() => downloadAs("mp4")}
+                  disabled={isConverting}
+                >
+                  {convertingFormat === "mp4"
+                    ? "Converting…"
+                    : "MP4"}
+                </button>
+              </div>
+            </div>
+
+            {(isConverting || ffmpegLoading) && (
+              <p className="recording-converting-hint">
+                {ffmpegLoading
+                  ? "Loading audio converter (~30 MB, one-time download)…"
+                  : `Converting to ${convertingFormat?.toUpperCase()}…`}
+              </p>
+            )}
+          </div>
         </section>
       )}
     </div>
