@@ -32,9 +32,8 @@ function initialsFromDisplayName(name) {
   return (parts[0]?.[0] ?? "?").toUpperCase();
 }
 
-function tileShowsCamera(tile) {
-  if (!tile?.tileId) return false;
-  return !tile.paused;
+function hasTile(tile) {
+  return Boolean(tile?.tileId);
 }
 
 function formatDuration(secs) {
@@ -269,7 +268,7 @@ function WaitingRoom({ roomCode, stream, camOn, micOn, onToggleCam, onToggleMic,
 
 // ─── VideoTile ────────────────────────────────────────────────────────────────
 
-function VideoTile({ tileId, localTile, session, label, paused }) {
+function VideoTile({ tileId, localTile, session, label, visible = true }) {
   const videoRef = useRef(null);
 
   useEffect(() => {
@@ -290,12 +289,9 @@ function VideoTile({ tileId, localTile, session, label, paused }) {
   }, [tileId, session]);
 
   return (
-    <div className="video-tile-wrap video-tile-wrap--live">
+    <div className={`video-tile-wrap video-tile-wrap--live ${visible ? "" : "video-tile-wrap--hidden"}`}>
       <video ref={videoRef} autoPlay playsInline muted={Boolean(localTile)} />
-      <div className="video-tile-label">
-        {label}
-        {paused ? " · Paused" : ""}
-      </div>
+      {visible && <div className="video-tile-label">{label}</div>}
     </div>
   );
 }
@@ -908,9 +904,7 @@ export default function App() {
 
   const showParticipantVideo = (p) => {
     if (p.isSelf && !localCamOn) return false;
-    const tile = tileByAttendeeId.get(p.attendeeId);
-    if (!tile) return false;
-    return tileShowsCamera(tile);
+    return hasTile(tileByAttendeeId.get(p.attendeeId));
   };
 
   const isConverting = Boolean(convertingFormat);
@@ -1115,18 +1109,23 @@ export default function App() {
                 {participants.map((p) => {
                   const tile = tileByAttendeeId.get(p.attendeeId);
                   const live = showParticipantVideo(p);
+                  const label = videoLabelForParticipant(p);
                   return (
                     <div key={p.attendeeId} className={`video-cell ${p.isSelf ? "video-cell--self" : ""}`} role="listitem">
-                      {live && tile ? (
-                        <VideoTile tileId={tile.tileId} localTile={tile.localTile} session={session} label={videoLabelForParticipant(p)} paused={tile.paused} />
-                      ) : (
+                      {/* Always keep VideoTile mounted when a tile exists —
+                          unmounting on `paused` breaks bindVideoElement and
+                          causes the glitch loop. The placeholder layers behind
+                          the video and shows through only when camera is truly off. */}
+                      {tile && (
+                        <VideoTile tileId={tile.tileId} localTile={tile.localTile} session={session} label={label} visible={live} />
+                      )}
+                      {!live && (
                         <div className="video-placeholder">
                           <div className="video-placeholder__avatar">{initialsFromDisplayName(p.displayName)}</div>
-                          <div className="video-placeholder__name">{videoLabelForParticipant(p)}</div>
+                          <div className="video-placeholder__name">{label}</div>
                           <div className="video-placeholder__status">
                             {p.isSelf && localCamOn && !tile ? "Starting camera…"
                               : p.isSelf && !localCamOn ? "Your camera is off"
-                              : tile?.paused ? "Video paused"
                               : "Camera off"}
                           </div>
                         </div>
@@ -1138,13 +1137,21 @@ export default function App() {
 
               <div className="meeting-toolbar" role="toolbar" aria-label="Call controls">
                 <button type="button" className={`toolbar-btn ${micMuted ? "toolbar-btn--off" : ""}`} onClick={toggleMic} aria-pressed={micMuted}>
-                  {micMuted ? "Unmute mic" : "Mute mic"}
+                  <span className="toolbar-btn__icon">{micMuted ? <MicOffIcon /> : <MicOnIcon />}</span>
+                  <span className="toolbar-btn__label">{micMuted ? "Unmute" : "Mute"}</span>
                 </button>
                 <button type="button" className={`toolbar-btn ${!localCamOn ? "toolbar-btn--off" : ""}`} onClick={toggleCamera} aria-pressed={!localCamOn}>
-                  {localCamOn ? "Stop camera" : "Start camera"}
+                  <span className="toolbar-btn__icon">{localCamOn ? <CamOnIcon /> : <CamOffIcon />}</span>
+                  <span className="toolbar-btn__label">{localCamOn ? "Stop cam" : "Start cam"}</span>
                 </button>
                 <button type="button" className="toolbar-btn toolbar-btn--danger" onClick={leave}>
-                  Leave visit
+                  <span className="toolbar-btn__icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+                      <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.1-1.1a2 2 0 0 1 2.11-.45 12 12 0 0 0 3.7.7 2 2 0 0 1 2 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 3.12 4.18 2 2 0 0 1 5 2h3a2 2 0 0 1 2 1.72 12 12 0 0 0 .7 3.7 2 2 0 0 1-.45 2.11z" />
+                      <line x1="1" y1="1" x2="23" y2="23" />
+                    </svg>
+                  </span>
+                  <span className="toolbar-btn__label">Leave</span>
                 </button>
               </div>
             </div>

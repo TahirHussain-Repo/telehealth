@@ -299,6 +299,8 @@
 .video-cell {
   min-height: 0;
   min-width: 0;
+  position: relative;
+  overflow: hidden;
 }
 
 .video-placeholder {
@@ -357,6 +359,15 @@
   display: block;
 }
 
+/* Keep the element mounted & bound for Chime but visually hidden */
+.video-tile-wrap--hidden {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .meeting-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -371,14 +382,24 @@
 }
 
 .meeting-toolbar .toolbar-btn {
-  min-width: 118px;
-  padding: 12px 18px;
+  min-width: 100px;
+  padding: 10px 18px;
   border-radius: 999px;
   font-weight: 600;
-  font-size: 0.875rem;
+  font-size: 0.85rem;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text-h);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+.toolbar-btn__icon {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .meeting-toolbar .toolbar-btn--off {
@@ -1489,7 +1510,7 @@ button.btn-danger {
 
   /* ── Global shell ── */
   .app-shell {
-    padding: 0 14px 28px;
+    padding: 0 12px 24px;
   }
 
   /* ── Lobby ── */
@@ -1498,25 +1519,33 @@ button.btn-danger {
   }
 
   .lobby-hero {
-    margin-bottom: 1.25rem;
+    margin-bottom: 1rem;
+  }
+
+  .lobby-title {
+    font-size: 1.35rem;
+  }
+
+  .lobby-lead {
+    font-size: 0.85rem;
   }
 
   .lobby-card {
-    padding: 1rem 0.9rem 0.9rem;
+    padding: 0.9rem;
   }
 
   .room-code {
-    font-size: 1.15rem;
-    letter-spacing: 0.12em;
+    font-size: 1.1rem;
+    letter-spacing: 0.1em;
   }
 
   /* ── Post-call recording ── */
   .recording-panel {
-    padding: 16px 0 28px;
+    padding: 14px 0 24px;
   }
 
   .recording-panel__inner {
-    padding: 18px 14px 16px;
+    padding: 16px 12px 14px;
   }
 
   .recording-downloads__btns {
@@ -1526,106 +1555,183 @@ button.btn-danger {
   .dl-btn {
     flex: 1;
     min-width: 0;
-    padding: 9px 10px;
+    padding: 9px 8px;
+    font-size: 0.8rem;
   }
 
-  /* ── In-call topbar ── */
+  /* ── In-call topbar: compact ── */
   .meeting-topbar {
-    padding: 10px 14px 11px;
-    gap: 8px;
+    padding: 8px 12px;
+    gap: 6px;
+  }
+
+  .app-logo--sm {
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+  }
+
+  .meeting-topbar__left {
+    gap: 10px;
   }
 
   .meeting-topbar__title {
-    font-size: 0.9rem;
+    font-size: 0.85rem;
   }
 
-  /* Hide room code on mobile — toolbar Copy ID still works */
   .meeting-topbar__id-group {
     display: none;
   }
 
   .meeting-topbar__meta {
-    font-size: 0.75rem;
-    gap: 4px;
+    font-size: 0.7rem;
+    gap: 3px;
   }
 
   .btn-toolbar-text {
-    font-size: 0.75rem;
-    padding: 6px 10px;
+    font-size: 0.72rem;
+    padding: 5px 8px;
   }
 
-  /* ── In-call workspace: tighter on mobile to max video space ── */
+  /* ── In-call workspace: remove ALL padding, let video touch edges ── */
   .meeting-workspace {
-    padding: 8px 10px;
-    gap: 8px;
+    padding: 0;
+    gap: 0;
   }
 
   .meeting-main {
-    gap: 8px;
+    gap: 0;
   }
 
-  /* ── In-call video: 1-column stack, tighter gap ── */
+  /* ── Hide sidebar on mobile (recording still runs in background) ── */
+  .meeting-sidebar {
+    display: none !important;
+  }
+
+  /* ── Video gallery: 1-column, fills remaining space ── */
   .video-gallery {
     grid-template-columns: 1fr;
-    gap: 8px;
+    gap: 2px;
+    border-radius: 0;
   }
 
-  /* ── In-call toolbar: equal-width buttons across row, compact ── */
+  .video-cell {
+    min-height: 0;
+  }
+
+  .video-placeholder {
+    border-radius: 0;
+    min-height: 140px;
+  }
+
+  .video-placeholder__avatar {
+    width: 56px;
+    height: 56px;
+    font-size: 1.05rem;
+  }
+
+  .video-placeholder__name {
+    font-size: 0.85rem;
+  }
+
+  .video-placeholder__status {
+    font-size: 0.75rem;
+  }
+
+  .video-tile-wrap--live {
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+  }
+
+  .video-tile-label {
+    padding: 6px 10px;
+    font-size: 0.72rem;
+  }
+
+  /* ── Toolbar: icon-only, circular buttons ── */
   .meeting-toolbar {
-    gap: 8px;
-    padding: 8px 10px;
-    border-radius: 10px;
+    gap: 16px;
+    padding: 10px 16px;
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
   }
 
   .meeting-toolbar .toolbar-btn {
     min-width: 0;
-    flex: 1;
-    padding: 9px 6px;
-    font-size: 0.8rem;
+    width: 48px;
+    height: 48px;
+    padding: 0;
+    border-radius: 50%;
+    flex: 0 0 auto;
   }
 
-  /* ── Hide recording sidebar on mobile (recording still runs) ── */
-  .meeting-sidebar {
+  /* Hide text labels, show icons only */
+  .toolbar-btn__label {
     display: none;
   }
 
-  /* ── Ensure each stacked tile has a minimum height ── */
-  .video-cell {
-    min-height: 160px;
+  /* ── Pre-join / waiting room ── */
+  .prejoin {
+    padding: 12px;
   }
 
-  /* ── Pre-join / waiting room: stack preview above settings ── */
   .prejoin__card {
     flex-direction: column;
     max-width: 100%;
     min-height: unset;
+    border-radius: 14px;
   }
 
   .prejoin__preview {
-    min-height: 220px;
-    flex: 0 0 220px;
+    min-height: 200px;
+    flex: 0 0 200px;
   }
 
   .prejoin__settings {
     flex: unset;
-    padding: 20px 18px 20px;
+    padding: 18px 14px;
     border-left: none;
     border-top: 1px solid var(--border);
+    gap: 14px;
   }
 
   .prejoin__ready {
-    font-size: 1.1rem;
+    font-size: 1.05rem;
+  }
+
+  .prejoin__device-row {
+    padding: 10px 12px;
+  }
+
+  .prejoin__device-label {
+    font-size: 0.82rem;
   }
 
   /* ── Admit toasts: full-width at bottom ── */
   .admit-toasts {
-    bottom: 12px;
-    right: 12px;
-    left: 12px;
+    bottom: 70px;
+    right: 10px;
+    left: 10px;
   }
 
   .admit-toast {
     min-width: unset;
     width: 100%;
+    padding: 10px 12px;
+    gap: 10px;
+    border-radius: 10px;
+  }
+
+  .admit-toast__text {
+    font-size: 0.8rem;
+  }
+
+  .admit-toast__deny,
+  .admit-toast__admit {
+    padding: 6px 12px;
+    font-size: 0.78rem;
   }
 }
