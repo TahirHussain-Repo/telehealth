@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { randomInt, randomUUID } from "crypto";
 import {
   ChimeSDKMeetingsClient,
+  CreateAttendeeCommand,
   CreateMeetingWithAttendeesCommand,
 } from "@aws-sdk/client-chime-sdk-meetings";
 
@@ -100,18 +101,15 @@ app.post("/api/meeting", async (req, res) => {
         MediaRegion: region,
         Attendees: [
           { ExternalUserId: `doctor-${randomUUID()}`.slice(0, 64) },
-          { ExternalUserId: `patient-${randomUUID()}`.slice(0, 64) },
         ],
       })
     );
 
     const doctor = response.Attendees[0];
-    const patient = response.Attendees[1];
 
     rooms.set(roomCode, {
       meeting: response.Meeting,
       doctor,
-      patient,
     });
 
     res.json({
@@ -126,7 +124,7 @@ app.post("/api/meeting", async (req, res) => {
 });
 
 /** Guest joins with the meeting ID the host shared. */
-app.post("/api/meeting/join", (req, res) => {
+app.post("/api/meeting/join", async (req, res) => {
   const raw = req.body?.roomCode;
   if (typeof raw !== "string" || !raw.trim()) {
     return res.status(400).json({ error: "Meeting ID is required" });
@@ -137,11 +135,22 @@ app.post("/api/meeting/join", (req, res) => {
     return res.status(404).json({ error: "No meeting found for that ID" });
   }
 
-  res.json({
-    roomCode,
-    meeting: room.meeting,
-    attendee: room.patient,
-  });
+  try {
+    const attendeeResp = await client.send(
+      new CreateAttendeeCommand({
+        MeetingId: room.meeting.MeetingId,
+        ExternalUserId: `patient-${randomUUID()}`.slice(0, 64),
+      })
+    );
+    res.json({
+      roomCode,
+      meeting: room.meeting,
+      attendee: attendeeResp.Attendee,
+    });
+  } catch (error) {
+    console.error("join attendee creation failed:", error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 /** Append a line to the visit transcript (from browser speech recognition per participant). */
@@ -215,20 +224,34 @@ app.post("/api/meeting/:roomCode/summarize", async (req, res) => {
 // ── Waiting room / knock flow ─────────────────────────────────────────────
 
 /** Patient knocks — enters the waiting room for this meeting. */
-app.post("/api/meeting/knock", (req, res) => {
+app.post("/api/meeting/knock", async (req, res) => {
   const roomCode = normalizeRoomCode(req.body?.roomCode);
   const room = rooms.get(roomCode);
   if (!room) {
     return res.status(404).json({ error: "No meeting found for that ID" });
   }
 
-  const knockId = randomUUID();
-  const entry = { knockId, roomCode, status: "pending", attendee: room.patient };
-  knocks.set(knockId, entry);
-  if (!room.knocks) room.knocks = new Map();
-  room.knocks.set(knockId, entry);
+  try {
+    // Create a unique attendee for this patient so multiple patients (or
+    // rejoins) never collide with AudioJoinedFromAnotherDevice.
+    const attendeeResp = await client.send(
+      new CreateAttendeeCommand({
+        MeetingId: room.meeting.MeetingId,
+        ExternalUserId: `patient-${randomUUID()}`.slice(0, 64),
+      })
+    );
 
-  res.json({ knockId });
+    const knockId = randomUUID();
+    const entry = { knockId, roomCode, status: "pending", attendee: attendeeResp.Attendee };
+    knocks.set(knockId, entry);
+    if (!room.knocks) room.knocks = new Map();
+    room.knocks.set(knockId, entry);
+
+    res.json({ knockId });
+  } catch (error) {
+    console.error("knock attendee creation failed:", error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 /** Patient polls this to find out if they have been admitted or denied. */

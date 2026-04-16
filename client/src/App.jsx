@@ -733,8 +733,21 @@ export default function App() {
           meetingSession.audioVideo.startLocalVideoTile();
         }
       },
-      audioVideoDidStop: () => {
+      audioVideoDidStop: (sessionStatus) => {
         setMediaConnected(false);
+        const code = sessionStatus?.statusCode?.();
+        // AudioJoinedFromAnotherDevice = 2 — same attendee connected elsewhere.
+        // Break out of the reconnect loop and send user back to lobby.
+        if (code === 2) {
+          alert("This session was disconnected because the same credentials were used elsewhere. Please rejoin.");
+          rosterRef.current = new Map();
+          setParticipants([]);
+          setVideoTiles({});
+          setSession(null);
+          setVisitContext(null);
+          setScreen("lobby");
+          return;
+        }
         rosterRef.current = new Map();
         setParticipants([]);
         setVideoTiles({});
