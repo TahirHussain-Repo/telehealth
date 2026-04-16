@@ -11,8 +11,17 @@
 }
 
 .app-shell--meeting {
-  max-width: 1280px;
-  padding-top: 8px;
+  /* Full-viewport takeover — break out of the centered #root container */
+  position: fixed;
+  inset: 0;
+  max-width: unset;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+  z-index: 10;
 }
 
 /* ——— Lobby (pre-call) ——— */
@@ -182,9 +191,10 @@
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 0 18px;
+  padding: 12px 20px 14px;
   border-bottom: 1px solid var(--border);
-  margin-bottom: 4px;
+  margin-bottom: 0;
+  flex-shrink: 0;
   text-align: left;
 }
 
@@ -243,44 +253,51 @@
 }
 
 .meeting-workspace {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 20px;
-  margin-top: 16px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px;
+  overflow: hidden;
 }
 
 @media (min-width: 960px) {
   .meeting-workspace {
-    grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+    flex-direction: row;
     align-items: stretch;
   }
 }
 
 .meeting-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  min-width: 0;
+  gap: 10px;
 }
 
 .video-gallery {
+  flex: 1;
+  min-height: 0;
   display: grid;
-  grid-template-columns: 1fr;
-  gap: 14px;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
 }
 
-@media (min-width: 640px) {
-  .video-gallery {
-    grid-template-columns: 1fr 1fr;
-  }
+/* Single participant spans full width */
+.video-cell:only-child {
+  grid-column: 1 / -1;
 }
 
 .video-cell {
   min-height: 0;
+  min-width: 0;
 }
 
 .video-placeholder {
-  aspect-ratio: 16 / 10;
+  height: 100%;
   border-radius: 14px;
   background: linear-gradient(165deg, #1e293b 0%, #0f172a 100%);
   border: 1px solid var(--border);
@@ -324,7 +341,7 @@
   border-radius: 14px;
   overflow: hidden;
   background: #0a0b0f;
-  aspect-ratio: 16 / 10;
+  height: 100%;
   border: 1px solid var(--border);
 }
 
@@ -340,11 +357,12 @@
   flex-wrap: wrap;
   gap: 12px;
   justify-content: center;
-  padding: 16px 18px;
+  padding: 12px 18px;
   background: var(--social-bg);
   border: 1px solid var(--border);
   border-radius: 14px;
   box-shadow: var(--shadow);
+  flex-shrink: 0;
 }
 
 .meeting-toolbar .toolbar-btn {
@@ -379,7 +397,15 @@
   flex-direction: column;
   gap: 14px;
   min-width: 0;
-  max-height: min(78vh, 900px);
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+@media (min-width: 960px) {
+  .meeting-sidebar {
+    width: 300px;
+    max-height: unset;
+  }
 }
 
 .transcript-speaker-panel--compact {
@@ -1135,4 +1161,351 @@ button.btn-danger {
   text-align: center;
   padding: 4px 0;
   margin: 0;
+}
+
+/* ─── Pre-join screen ───────────────────────────────────────────────────── */
+
+.prejoin {
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  padding: 24px 16px;
+}
+
+.prejoin__card {
+  display: flex;
+  width: 100%;
+  max-width: 860px;
+  min-height: 460px;
+  border-radius: 20px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+
+/* Left — camera preview */
+.prejoin__preview {
+  flex: 1 1 55%;
+  background: #0a0a0a;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+}
+
+.prejoin__video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* Mirror the local preview like a selfie camera */
+  transform: scaleX(-1);
+  display: block;
+}
+
+.prejoin__no-cam {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 0.9rem;
+}
+
+.prejoin__no-cam svg {
+  opacity: 0.4;
+  width: 48px;
+  height: 48px;
+}
+
+/* Right — settings panel */
+.prejoin__settings {
+  flex: 0 0 45%;
+  background: var(--surface);
+  padding: 32px 28px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  border-left: 1px solid var(--border);
+}
+
+.prejoin__settings-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.prejoin__title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.prejoin__subtitle {
+  font-size: 0.82rem;
+  color: var(--text);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.prejoin__room-code {
+  font-family: var(--font-mono, monospace);
+  color: var(--text);
+}
+
+.prejoin__ready {
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: var(--text-h);
+  margin: 0;
+}
+
+/* Device toggle rows */
+.prejoin__devices {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+}
+
+.prejoin__device-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 13px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text-h);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.prejoin__device-row:hover {
+  border-color: var(--accent);
+  background: rgba(99, 102, 241, 0.06);
+}
+
+.prejoin__device-row--off {
+  opacity: 0.65;
+}
+
+.prejoin__device-icon {
+  flex-shrink: 0;
+  color: var(--text-h);
+  display: flex;
+}
+
+.prejoin__device-label {
+  flex: 1;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+/* iOS-style pill toggle */
+.prejoin__toggle {
+  flex-shrink: 0;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  position: relative;
+  transition: background 0.2s;
+}
+
+.prejoin__toggle--on {
+  background: var(--accent);
+}
+
+.prejoin__toggle-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  transition: transform 0.2s;
+}
+
+.prejoin__toggle--on .prejoin__toggle-knob {
+  transform: translateX(18px);
+}
+
+/* Actions */
+.prejoin__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: auto;
+}
+
+.prejoin__join-btn {
+  flex: 1;
+}
+
+/* ─── Waiting room extras ─────────────────────────────────────────────────── */
+
+.waiting__status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.waiting__spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.waiting__heading {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.waiting__hint {
+  font-size: 0.875rem;
+  color: var(--text);
+  margin: 0;
+}
+
+/* ─── Doctor admit toasts ────────────────────────────────────────────────── */
+
+.admit-toasts {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+}
+
+.admit-toast {
+  pointer-events: all;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  min-width: 300px;
+  animation: toast-in 0.25s ease;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.admit-toast__info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+.admit-toast__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+.admit-toast__text {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.admit-toast__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.admit-toast__deny {
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.admit-toast__deny:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: #ef4444;
+  color: #ef4444;
+}
+
+.admit-toast__admit {
+  padding: 7px 16px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.admit-toast__admit:hover {
+  opacity: 0.88;
+}
+
+/* Responsive — stack preview above settings on narrow screens */
+@media (max-width: 640px) {
+  .prejoin__card {
+    flex-direction: column;
+    max-width: 100%;
+    min-height: unset;
+  }
+
+  .prejoin__preview {
+    min-height: 200px;
+    flex: 0 0 200px;
+  }
+
+  .prejoin__settings {
+    flex: unset;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+
+  .admit-toasts {
+    bottom: 12px;
+    right: 12px;
+    left: 12px;
+  }
+
+  .admit-toast {
+    min-width: unset;
+    width: 100%;
+  }
 }

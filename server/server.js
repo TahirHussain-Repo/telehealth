@@ -32,11 +32,14 @@ function makeRoomCode() {
   return code;
 }
 
-/** roomCode -> { meeting, doctor, patient } */
+/** roomCode -> { meeting, doctor, patient, knocks: Map } */
 const rooms = new Map();
 
 /** roomCode -> [{ speaker, text, at }] */
 const transcripts = new Map();
+
+/** knockId -> { knockId, roomCode, status: 'pending'|'admitted'|'denied', attendee } */
+const knocks = new Map();
 
 function normalizeRoomCode(raw) {
   if (typeof raw !== "string") return "";
@@ -207,6 +210,81 @@ app.post("/api/meeting/:roomCode/summarize", async (req, res) => {
     console.error(e);
     res.status(500).json({ error: e.message || "Summarization failed" });
   }
+});
+
+// ── Waiting room / knock flow ─────────────────────────────────────────────
+
+/** Patient knocks — enters the waiting room for this meeting. */
+app.post("/api/meeting/knock", (req, res) => {
+  const roomCode = normalizeRoomCode(req.body?.roomCode);
+  const room = rooms.get(roomCode);
+  if (!room) {
+    return res.status(404).json({ error: "No meeting found for that ID" });
+  }
+
+  const knockId = randomUUID();
+  const entry = { knockId, roomCode, status: "pending", attendee: room.patient };
+  knocks.set(knockId, entry);
+  if (!room.knocks) room.knocks = new Map();
+  room.knocks.set(knockId, entry);
+
+  res.json({ knockId });
+});
+
+/** Patient polls this to find out if they have been admitted or denied. */
+app.get("/api/meeting/knock/:knockId", (req, res) => {
+  const entry = knocks.get(req.params.knockId);
+  if (!entry) return res.status(404).json({ error: "Knock not found" });
+
+  if (entry.status === "admitted") {
+    const room = rooms.get(entry.roomCode);
+    if (!room) return res.status(404).json({ error: "Meeting has ended" });
+    return res.json({
+      status: "admitted",
+      meeting: room.meeting,
+      attendee: entry.attendee,
+      roomCode: entry.roomCode,
+    });
+  }
+
+  res.json({ status: entry.status });
+});
+
+/** Doctor polls to see who is waiting. */
+app.get("/api/meeting/:roomCode/knocks", (req, res) => {
+  const roomCode = normalizeRoomCode(req.params.roomCode);
+  if (!rooms.has(roomCode)) {
+    return res.status(404).json({ error: "Unknown meeting ID" });
+  }
+  const room = rooms.get(roomCode);
+  const pending = room.knocks
+    ? [...room.knocks.values()]
+        .filter((k) => k.status === "pending")
+        .map((k) => ({ knockId: k.knockId }))
+    : [];
+  res.json({ knocks: pending });
+});
+
+/** Doctor admits a patient from the waiting room. */
+app.post("/api/meeting/:roomCode/admit/:knockId", (req, res) => {
+  const roomCode = normalizeRoomCode(req.params.roomCode);
+  const entry = knocks.get(req.params.knockId);
+  if (!entry || entry.roomCode !== roomCode) {
+    return res.status(404).json({ error: "Knock not found" });
+  }
+  entry.status = "admitted";
+  res.json({ ok: true });
+});
+
+/** Doctor denies a patient from the waiting room. */
+app.post("/api/meeting/:roomCode/deny/:knockId", (req, res) => {
+  const roomCode = normalizeRoomCode(req.params.roomCode);
+  const entry = knocks.get(req.params.knockId);
+  if (!entry || entry.roomCode !== roomCode) {
+    return res.status(404).json({ error: "Knock not found" });
+  }
+  entry.status = "denied";
+  res.json({ ok: true });
 });
 
 app.listen(port, () => {
