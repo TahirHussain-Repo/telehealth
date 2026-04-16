@@ -731,12 +731,18 @@ export default function App() {
     };
 
     meetingSession.audioVideo.addObserver({
-      audioVideoDidStart: () => {
+      audioVideoDidStart: async () => {
         setMediaConnected(true);
-        // Start local camera here — session is fully ready at this point.
-        // Calling startLocalVideoTile() immediately after audioVideo.start()
-        // is a race condition; the tile silently fails if the session isn't
-        // yet negotiated.
+        // Bind audio output here — the session is fully negotiated at this
+        // point. Binding before start() silently fails on many browsers
+        // (especially mobile Safari), leaving remote audio inaudible.
+        if (audioElRef.current) {
+          try {
+            await meetingSession.audioVideo.bindAudioElement(audioElRef.current);
+          } catch (e) {
+            console.warn("bindAudioElement:", e);
+          }
+        }
         if (!meta.initialCamOff) {
           meetingSession.audioVideo.startLocalVideoTile();
         }
@@ -803,10 +809,6 @@ export default function App() {
     const videoInputs = await meetingSession.audioVideo.listVideoInputDevices();
     if (videoInputs.length > 0) {
       await meetingSession.audioVideo.startVideoInput(videoInputs[0].deviceId);
-    }
-
-    if (audioElRef.current) {
-      await meetingSession.audioVideo.bindAudioElement(audioElRef.current);
     }
 
     meetingSession.audioVideo.start();
