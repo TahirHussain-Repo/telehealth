@@ -1,13 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
-import {
-  ConsoleLogger,
-  DefaultDeviceController,
-  DefaultMeetingSession,
-  LogLevel,
-  MeetingSessionConfiguration,
-} from "amazon-chime-sdk-js";
 import "./App.css";
 
 const API_URL =
@@ -32,8 +25,9 @@ function initialsFromDisplayName(name) {
   return (parts[0]?.[0] ?? "?").toUpperCase();
 }
 
-function hasTile(tile) {
-  return Boolean(tile?.tileId);
+function hasUsableVideo(stream) {
+  if (!stream) return false;
+  return stream.getVideoTracks().some((t) => t.readyState === "live");
 }
 
 function formatDuration(secs) {
@@ -268,25 +262,14 @@ function WaitingRoom({ roomCode, stream, camOn, micOn, onToggleCam, onToggleMic,
 
 // ─── VideoTile ────────────────────────────────────────────────────────────────
 
-function VideoTile({ tileId, localTile, session, label, visible = true }) {
+function VideoTile({ stream, localTile, label, visible = true }) {
   const videoRef = useRef(null);
 
   useEffect(() => {
     const el = videoRef.current;
-    if (!el || !session) return undefined;
-    try {
-      session.audioVideo.bindVideoElement(tileId, el);
-    } catch (err) {
-      console.warn("bindVideoElement failed:", err);
-    }
-    return () => {
-      try {
-        session.audioVideo.unbindVideoElement(tileId);
-      } catch {
-        /* noop */
-      }
-    };
-  }, [tileId, session]);
+    if (!el) return;
+    el.srcObject = stream ?? null;
+  }, [stream]);
 
   return (
     <div className={`video-tile-wrap video-tile-wrap--live ${visible ? "" : "video-tile-wrap--hidden"}`}>
@@ -307,7 +290,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [mediaConnected, setMediaConnected] = useState(false);
   const [participants, setParticipants] = useState([]);
-  const [videoTiles, setVideoTiles] = useState({});
+  const [remoteStreams, setRemoteStreams] = useState({});
+  const [, setPeerIds] = useState([]);
   const [visitContext, setVisitContext] = useState(null);
   const [micMuted, setMicMuted] = useState(false);
   const [localCamOn, setLocalCamOn] = useState(true);
@@ -338,19 +322,23 @@ export default function App() {
   const [ffmpegLoading, setFfmpegLoading] = useState(false);
 
   // ── Refs ────────────────────────────────────────────────────────────────
-  const rosterRef = useRef(new Map());
-  const audioElRef = useRef(null);
+  const wsRef = useRef(null);
+  const peerConnectionsRef = useRef(new Map());
+  const remoteStreamsRef = useRef(new Map());
+  const localCallStreamRef = useRef(null);
   const audioCtxRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
   const localMicStreamRef = useRef(null);
   const ffmpegRef = useRef(null);
   const recordingDestRef = useRef(null);       // AudioContext destination node
-  const lateRemoteConnectRef = useRef(null);   // cleanup handle for lazy remote-audio hookup
+  const connectedRemoteRecordingTrackIdsRef = useRef(new Set());
+  const streamAddTrackListenersRef = useRef(new WeakSet());
   const prejoinStreamRef = useRef(null);
 
   const roomCode = visitContext?.roomCode ?? hostPayload?.roomCode ?? null;
   const inCall = Boolean(session);
+  const rtcConfig = useMemo(() => ({ iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] }), []);
 
   // ── Blob URL lifecycle ──────────────────────────────────────────────────
   useEffect(() => {
@@ -403,14 +391,15 @@ export default function App() {
   // ── Patient: join when admitted ─────────────────────────────────────────
   useEffect(() => {
     if (!admittedData) return;
-    const { meeting, attendee, roomCode: admittedRoom } = admittedData;
+    const { participantId, roomCode: admittedRoom } = admittedData;
     const muted = !prejoinMicOn;
     const camOff = !prejoinCamOn;
     setAdmittedData(null);
     stopPrejoinStream();
-    connectChime(meeting, attendee, {
+    connectWebRTC({
       roomCode: admittedRoom,
       role: "patient",
+      participantId,
       initialMuted: muted,
       initialCamOff: camOff,
     }).catch((err) => {
@@ -497,9 +486,10 @@ export default function App() {
       stopPrejoinStream();
       setBusy(true);
       try {
-        await connectChime(hostPayload.meeting, hostPayload.attendee, {
+        await connectWebRTC({
           roomCode: hostPayload.roomCode,
           role: "doctor",
+          participantId: hostPayload.participantId,
           initialMuted: !prejoinMicOn,
           initialCamOff: !prejoinCamOn,
         });
@@ -566,14 +556,37 @@ export default function App() {
   };
 
   // ── Recording ───────────────────────────────────────────────────────────
+  // Recording starts when the signaling socket opens — often *before* WebRTC
+  // has remote media. We must add remote audio to the mix when `ontrack` fires.
+  const connectRemoteAudioToRecording = (stream) => {
+    const dest = recordingDestRef.current;
+    const ctx = audioCtxRef.current;
+    if (!dest || !ctx || !stream) return;
+    for (const track of stream.getAudioTracks()) {
+      if (track.readyState === "ended") continue;
+      if (connectedRemoteRecordingTrackIdsRef.current.has(track.id)) continue;
+      connectedRemoteRecordingTrackIdsRef.current.add(track.id);
+      try {
+        ctx.createMediaStreamSource(new MediaStream([track])).connect(dest);
+      } catch (e) {
+        console.warn("connectRemoteAudioToRecording:", e);
+      }
+    }
+  };
 
   const startRecording = async (initialMuted = false) => {
     try {
-      const remoteStream = audioElRef.current?.captureStream?.();
-      const localStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true },
-        video: false,
-      });
+      const localBase = localCallStreamRef.current;
+      let localStream;
+      const localAudioTracks = localBase?.getAudioTracks() ?? [];
+      if (localAudioTracks.length > 0) {
+        localStream = new MediaStream(localAudioTracks.map((t) => t.clone()));
+      } else {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true },
+          video: false,
+        });
+      }
       // Apply the join-time mute state immediately so there's no window where
       // a muted-on-join user's voice leaks into the recording.
       if (initialMuted) {
@@ -585,21 +598,10 @@ export default function App() {
       audioCtxRef.current = audioCtx;
       const dest = audioCtx.createMediaStreamDestination();
       recordingDestRef.current = dest;
+      connectedRemoteRecordingTrackIdsRef.current = new Set();
 
-      // Connect remote audio only if the stream already has tracks (patient already in call).
-      // When the doctor joins first, the audio element has no tracks yet — hook up lazily.
-      if (remoteStream?.getAudioTracks().length > 0) {
-        audioCtx.createMediaStreamSource(remoteStream).connect(dest);
-      } else {
-        const connectLate = () => {
-          const stream = audioElRef.current?.captureStream?.();
-          if (!stream || stream.getAudioTracks().length === 0) return;
-          try { audioCtx.createMediaStreamSource(stream).connect(dest); } catch (e) { console.warn("remote audio connect:", e); }
-          audioElRef.current?.removeEventListener("play", connectLate);
-          lateRemoteConnectRef.current = null;
-        };
-        audioElRef.current?.addEventListener("play", connectLate);
-        lateRemoteConnectRef.current = connectLate;
+      for (const stream of remoteStreamsRef.current.values()) {
+        connectRemoteAudioToRecording(stream);
       }
       audioCtx.createMediaStreamSource(localStream).connect(dest);
 
@@ -633,14 +635,11 @@ export default function App() {
     if (rec && rec.state !== "inactive") rec.stop();
     audioCtxRef.current?.close();
     localMicStreamRef.current?.getTracks().forEach((t) => t.stop());
-    if (lateRemoteConnectRef.current) {
-      audioElRef.current?.removeEventListener("play", lateRemoteConnectRef.current);
-      lateRemoteConnectRef.current = null;
-    }
     mediaRecorderRef.current = null;
     audioCtxRef.current = null;
     localMicStreamRef.current = null;
     recordingDestRef.current = null;
+    connectedRemoteRecordingTrackIdsRef.current = new Set();
     setRecording(false);
   };
 
@@ -698,141 +697,150 @@ export default function App() {
     }
   };
 
-  // ── Chime session ───────────────────────────────────────────────────────
+  // ── WebRTC session ──────────────────────────────────────────────────────
 
-  const connectChime = async (meeting, attendee, meta) => {
+  const syncParticipants = (meta, selfId, ids) => {
+    const localLabel = meta.role === "doctor" ? "Clinician" : "Patient";
+    const remotes = ids.map((id) => ({
+      attendeeId: id,
+      displayName: displayNameFromExternal(id),
+      isSelf: false,
+    }));
+    remotes.sort((a, b) => a.displayName.localeCompare(b.displayName));
+    setParticipants([{ attendeeId: selfId, displayName: `${localLabel} (you)`, isSelf: true }, ...remotes]);
+  };
+
+  const closePeer = (peerId) => {
+    const pc = peerConnectionsRef.current.get(peerId);
+    if (pc) {
+      try { pc.close(); } catch { /* noop */ }
+      peerConnectionsRef.current.delete(peerId);
+    }
+    remoteStreamsRef.current.delete(peerId);
+    setRemoteStreams((prev) => {
+      const next = { ...prev };
+      delete next[peerId];
+      return next;
+    });
+  };
+
+  const createPeerConnection = (peerId, ws) => {
+    if (peerConnectionsRef.current.has(peerId)) return peerConnectionsRef.current.get(peerId);
+    const pc = new RTCPeerConnection(rtcConfig);
+    peerConnectionsRef.current.set(peerId, pc);
+    const local = localCallStreamRef.current;
+    if (local) {
+      for (const track of local.getTracks()) pc.addTrack(track, local);
+    }
+    pc.ontrack = (event) => {
+      const [stream] = event.streams;
+      if (!stream) return;
+      remoteStreamsRef.current.set(peerId, stream);
+      setRemoteStreams((prev) => ({ ...prev, [peerId]: stream }));
+      connectRemoteAudioToRecording(stream);
+      if (!streamAddTrackListenersRef.current.has(stream)) {
+        streamAddTrackListenersRef.current.add(stream);
+        stream.addEventListener("addtrack", () => connectRemoteAudioToRecording(stream));
+      }
+    };
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) return;
+      ws.send(JSON.stringify({ type: "signal", to: peerId, data: { candidate: event.candidate } }));
+    };
+    pc.onconnectionstatechange = () => {
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        closePeer(peerId);
+      }
+    };
+    return pc;
+  };
+
+  const connectWebRTC = async (meta) => {
     setRecordedBlob(null);
     setRecordingError(null);
-    rosterRef.current = new Map();
     setParticipants([]);
-    setVideoTiles({});
+    setRemoteStreams({});
+    remoteStreamsRef.current = new Map();
+    setPeerIds([]);
     setMediaConnected(false);
     setLocalCamOn(!meta.initialCamOff);
     setPendingKnocks([]);
 
-    const logger = new ConsoleLogger("ChimeLogs", LogLevel.INFO);
-    const deviceController = new DefaultDeviceController(logger);
-    const config = new MeetingSessionConfiguration(meeting, attendee);
-    const meetingSession = new DefaultMeetingSession(config, logger, deviceController);
-    const myId = attendee.AttendeeId;
+    let local = prejoinStreamRef.current;
+    if (!local) {
+      local = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    }
+    local.getAudioTracks().forEach((t) => { t.enabled = !meta.initialMuted; });
+    local.getVideoTracks().forEach((t) => { t.enabled = !meta.initialCamOff; });
+    localCallStreamRef.current = local;
+    setMicMuted(meta.initialMuted);
 
-    const syncRosterToState = () => {
-      const localLabel = meta.role === "doctor" ? "Clinician" : "Patient";
-      const remotes = [...rosterRef.current.entries()].map(([id, data]) => ({
-        attendeeId: id,
-        displayName: displayNameFromExternal(data.externalUserId),
-        isSelf: false,
-      }));
-      remotes.sort((a, b) => a.displayName.localeCompare(b.displayName));
-      setParticipants([
-        { attendeeId: myId, displayName: `${localLabel} (you)`, isSelf: true },
-        ...remotes,
-      ]);
+    const base = API_URL || window.location.origin;
+    const wsUrl = new URL(base);
+    wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
+    wsUrl.searchParams.set("roomCode", meta.roomCode);
+    wsUrl.searchParams.set("participantId", meta.participantId);
+    wsUrl.searchParams.set("role", meta.role);
+
+    const ws = new WebSocket(wsUrl.toString());
+    wsRef.current = ws;
+    ws.onopen = async () => {
+      setMediaConnected(true);
+      await startRecording(meta.initialMuted ?? false);
+    };
+    ws.onclose = () => setMediaConnected(false);
+
+    ws.onmessage = async (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+
+      if (msg.type === "peers" && Array.isArray(msg.peers)) {
+        setPeerIds(msg.peers);
+        syncParticipants(meta, meta.participantId, msg.peers);
+        return;
+      }
+
+      if (msg.type === "peer-joined" && typeof msg.peerId === "string") {
+        setPeerIds((prev) => {
+          const next = prev.includes(msg.peerId) ? prev : [...prev, msg.peerId];
+          syncParticipants(meta, meta.participantId, next);
+          return next;
+        });
+        const pc = createPeerConnection(msg.peerId, ws);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: "signal", to: msg.peerId, data: { sdp: pc.localDescription } }));
+        return;
+      }
+
+      if (msg.type === "peer-left" && typeof msg.peerId === "string") {
+        closePeer(msg.peerId);
+        setPeerIds((prev) => {
+          const next = prev.filter((id) => id !== msg.peerId);
+          syncParticipants(meta, meta.participantId, next);
+          return next;
+        });
+        return;
+      }
+
+      if (msg.type === "signal" && typeof msg.from === "string" && msg.data) {
+        const pc = createPeerConnection(msg.from, ws);
+        if (msg.data.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.data.sdp));
+          if (msg.data.sdp.type === "offer") {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type: "signal", to: msg.from, data: { sdp: pc.localDescription } }));
+          }
+        } else if (msg.data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.data.candidate));
+        }
+      }
     };
 
-    meetingSession.audioVideo.addObserver({
-      audioVideoDidStart: async () => {
-        setMediaConnected(true);
-        // Bind audio output here — the session is fully negotiated at this
-        // point. Binding before start() silently fails on many browsers
-        // (especially mobile Safari), leaving remote audio inaudible.
-        if (audioElRef.current) {
-          try {
-            await meetingSession.audioVideo.bindAudioElement(audioElRef.current);
-          } catch (e) {
-            console.warn("bindAudioElement:", e);
-          }
-        }
-        if (!meta.initialCamOff) {
-          meetingSession.audioVideo.startLocalVideoTile();
-        }
-      },
-      audioVideoDidStop: (sessionStatus) => {
-        setMediaConnected(false);
-        const code = sessionStatus?.statusCode?.();
-        // AudioJoinedFromAnotherDevice = 2 — same attendee connected elsewhere.
-        // Break out of the reconnect loop and send user back to lobby.
-        if (code === 2) {
-          alert("This session was disconnected because the same credentials were used elsewhere. Please rejoin.");
-          rosterRef.current = new Map();
-          setParticipants([]);
-          setVideoTiles({});
-          setSession(null);
-          setVisitContext(null);
-          setScreen("lobby");
-          return;
-        }
-        rosterRef.current = new Map();
-        setParticipants([]);
-        setVideoTiles({});
-      },
-      videoTileDidUpdate: (tileState) => {
-        if (!tileState.tileId || tileState.isContent) return;
-        // Tiles can fire before they are bound to an attendee (e.g. during
-        // negotiation). Skip — but do NOT delete existing bound tile state,
-        // because that would briefly unmount the VideoTile component and break
-        // the bindVideoElement → video element connection.
-        if (!tileState.boundAttendeeId) return;
-        setVideoTiles((prev) => ({
-          ...prev,
-          [tileState.tileId]: {
-            tileId: tileState.tileId,
-            attendeeId: tileState.boundAttendeeId,
-            externalUserId: tileState.boundExternalUserId,
-            localTile: tileState.localTile,
-            active: tileState.active,
-            paused: tileState.paused,
-          },
-        }));
-      },
-      videoTileWasRemoved: (tileId) => {
-        setVideoTiles((prev) => { const n = { ...prev }; delete n[tileId]; return n; });
-      },
-    });
-
-    meetingSession.audioVideo.realtimeSubscribeToAttendeeIdPresence(
-      (attendeeId, present, externalUserId) => {
-        if (attendeeId === myId) return;
-        if (present) {
-          rosterRef.current.set(attendeeId, { externalUserId: externalUserId || "" });
-        } else {
-          rosterRef.current.delete(attendeeId);
-        }
-        syncRosterToState();
-      }
-    );
-
-    const audioInputs = await meetingSession.audioVideo.listAudioInputDevices();
-    const audioDeviceId = audioInputs[0]?.deviceId ?? "default";
-    await meetingSession.audioVideo.startAudioInput(audioDeviceId);
-
-    const videoInputs = await meetingSession.audioVideo.listVideoInputDevices();
-    if (videoInputs.length > 0) {
-      await meetingSession.audioVideo.startVideoInput(videoInputs[0].deviceId);
-    }
-
-    meetingSession.audioVideo.start();
-
-    if (meta.initialMuted) {
-      meetingSession.audioVideo.realtimeMuteLocalAudio();
-    }
-
-    meetingSession.audioVideo.realtimeSubscribeToMuteAndUnmuteLocalAudio((muted) => {
-      setMicMuted(muted);
-      // Keep the recording mic track in sync — muting in the call must silence
-      // the local recording track too, not just the Chime send path.
-      localMicStreamRef.current?.getAudioTracks().forEach((t) => {
-        t.enabled = !muted;
-      });
-    });
-    setMicMuted(
-      meta.initialMuted ? true : meetingSession.audioVideo.realtimeIsLocalAudioMuted()
-    );
-
-    syncRosterToState();
+    syncParticipants(meta, meta.participantId, []);
     setVisitContext({ roomCode: meta.roomCode, role: meta.role });
-    setSession(meetingSession);
-    await startRecording(meta.initialMuted ?? false);
+    setSession({ roomCode: meta.roomCode, role: meta.role, participantId: meta.participantId });
   };
 
   // ── Lobby actions ───────────────────────────────────────────────────────
@@ -841,11 +849,9 @@ export default function App() {
     setBusy(true);
     try {
       const res = await fetch(`${API_URL}/api/meeting`, { method: "POST" });
-      const raw = await res.text();
-      let data;
-      try { data = JSON.parse(raw); } catch { throw new Error(`Non-JSON: ${raw.slice(0, 200)}`); }
+      const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Could not start visit");
-      setHostPayload({ roomCode: data.roomCode, meeting: data.meeting, attendee: data.attendee });
+      setHostPayload({ roomCode: data.roomCode, participantId: data.participantId });
     } catch (e) {
       console.error(e); alert(e.message || "Failed to start visit");
     } finally {
@@ -866,16 +872,23 @@ export default function App() {
 
   const leave = () => {
     stopRecording();
-    if (session) {
-      session.audioVideo.stopLocalVideoTile();
-      session.audioVideo.stop();
-      setSession(null);
+    wsRef.current?.close();
+    wsRef.current = null;
+    for (const pc of peerConnectionsRef.current.values()) {
+      try { pc.close(); } catch { /* noop */ }
     }
+    peerConnectionsRef.current.clear();
+    if (localCallStreamRef.current) {
+      localCallStreamRef.current.getTracks().forEach((t) => t.stop());
+      localCallStreamRef.current = null;
+    }
+    remoteStreamsRef.current = new Map();
+    setRemoteStreams({});
+    setPeerIds([]);
+    setSession(null);
     setVisitContext(null);
     setMediaConnected(false);
-    rosterRef.current = new Map();
     setParticipants([]);
-    setVideoTiles({});
     setMicMuted(false);
     setLocalCamOn(true);
     setPendingKnocks([]);
@@ -883,30 +896,30 @@ export default function App() {
   };
 
   const toggleMic = () => {
-    if (!session) return;
-    const av = session.audioVideo;
-    if (av.realtimeIsLocalAudioMuted()) av.realtimeUnmuteLocalAudio();
-    else av.realtimeMuteLocalAudio();
+    if (!localCallStreamRef.current) return;
+    const nextMuted = !micMuted;
+    localCallStreamRef.current.getAudioTracks().forEach((t) => { t.enabled = !nextMuted; });
+    localMicStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = !nextMuted; });
+    setMicMuted(nextMuted);
   };
 
   const toggleCamera = () => {
-    if (!session) return;
-    const av = session.audioVideo;
-    if (localCamOn) { av.stopLocalVideoTile(); setLocalCamOn(false); }
-    else { av.startLocalVideoTile(); setLocalCamOn(true); }
+    if (!localCallStreamRef.current) return;
+    const nextCamOn = !localCamOn;
+    localCallStreamRef.current.getVideoTracks().forEach((t) => { t.enabled = nextCamOn; });
+    setLocalCamOn(nextCamOn);
   };
 
   // ── Derived ─────────────────────────────────────────────────────────────
 
   const remoteOthersCount = Math.max(0, participants.length - 1);
 
-  const tileByAttendeeId = useMemo(() => {
+  const streamByAttendeeId = useMemo(() => {
     const m = new Map();
-    for (const t of Object.values(videoTiles)) {
-      if (t.attendeeId) m.set(t.attendeeId, t);
-    }
+    if (session?.participantId) m.set(session.participantId, localCallStreamRef.current);
+    for (const [id, stream] of Object.entries(remoteStreams)) m.set(id, stream);
     return m;
-  }, [videoTiles]);
+  }, [remoteStreams, session]);
 
   const copyRoomCode = async () => {
     if (!hostPayload?.roomCode) return;
@@ -927,7 +940,7 @@ export default function App() {
 
   const showParticipantVideo = (p) => {
     if (p.isSelf && !localCamOn) return false;
-    return hasTile(tileByAttendeeId.get(p.attendeeId));
+    return hasUsableVideo(streamByAttendeeId.get(p.attendeeId));
   };
 
   const isConverting = Boolean(convertingFormat);
@@ -936,9 +949,6 @@ export default function App() {
 
   return (
     <div className={`app-shell ${inCall ? "app-shell--meeting" : ""}`}>
-      {/* Hidden Chime audio sink */}
-      <audio ref={audioElRef} autoPlay style={{ display: "none" }} />
-
       {/* ── Pre-join screen ── */}
       {!inCall && screen === "prejoin" && (
         <PreJoinScreen
@@ -1130,24 +1140,20 @@ export default function App() {
             <div className="meeting-main">
               <div className="video-gallery" role="list" aria-label="Video feeds">
                 {participants.map((p) => {
-                  const tile = tileByAttendeeId.get(p.attendeeId);
+                  const stream = streamByAttendeeId.get(p.attendeeId);
                   const live = showParticipantVideo(p);
                   const label = videoLabelForParticipant(p);
                   return (
                     <div key={p.attendeeId} className={`video-cell ${p.isSelf ? "video-cell--self" : ""}`} role="listitem">
-                      {/* Always keep VideoTile mounted when a tile exists —
-                          unmounting on `paused` breaks bindVideoElement and
-                          causes the glitch loop. The placeholder layers behind
-                          the video and shows through only when camera is truly off. */}
-                      {tile && (
-                        <VideoTile tileId={tile.tileId} localTile={tile.localTile} session={session} label={label} visible={live} />
+                      {stream && (
+                        <VideoTile stream={stream} localTile={p.isSelf} label={label} visible={live} />
                       )}
                       {!live && (
                         <div className="video-placeholder">
                           <div className="video-placeholder__avatar">{initialsFromDisplayName(p.displayName)}</div>
                           <div className="video-placeholder__name">{label}</div>
                           <div className="video-placeholder__status">
-                            {p.isSelf && localCamOn && !tile ? "Starting camera…"
+                            {p.isSelf && localCamOn && !stream ? "Starting camera…"
                               : p.isSelf && !localCamOn ? "Your camera is off"
                               : "Camera off"}
                           </div>

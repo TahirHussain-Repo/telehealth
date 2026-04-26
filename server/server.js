@@ -2,11 +2,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { randomInt, randomUUID } from "crypto";
-import {
-  ChimeSDKMeetingsClient,
-  CreateAttendeeCommand,
-  CreateMeetingWithAttendeesCommand,
-} from "@aws-sdk/client-chime-sdk-meetings";
+import { createServer } from "http";
+import { WebSocketServer } from "ws";
 
 dotenv.config();
 
@@ -14,9 +11,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const region = process.env.AWS_REGION || "us-east-1";
-const client = new ChimeSDKMeetingsClient({ region });
 const port = process.env.PORT || 4000;
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
@@ -33,14 +30,109 @@ function makeRoomCode() {
   return code;
 }
 
-/** roomCode -> { meeting, doctor, patient, knocks: Map } */
+/** roomCode -> { roomCode, doctorParticipantId, participants: Set<string>, knocks: Map } */
 const rooms = new Map();
 
 /** roomCode -> [{ speaker, text, at }] */
 const transcripts = new Map();
 
-/** knockId -> { knockId, roomCode, status: 'pending'|'admitted'|'denied', attendee } */
+/** knockId -> { knockId, roomCode, status: 'pending'|'admitted'|'denied', participantId } */
 const knocks = new Map();
+
+/** participantId -> ws */
+const socketsByParticipant = new Map();
+
+/** participantId -> roomCode */
+const roomByParticipant = new Map();
+
+function safeSend(ws, payload) {
+  if (!ws || ws.readyState !== ws.OPEN) return;
+  ws.send(JSON.stringify(payload));
+}
+
+function broadcastToRoom(roomCode, payload, exceptParticipantId = null) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  for (const participantId of room.participants) {
+    if (participantId === exceptParticipantId) continue;
+    const ws = socketsByParticipant.get(participantId);
+    safeSend(ws, payload);
+  }
+}
+
+function attachParticipantToRoom({ participantId, roomCode, role }) {
+  const room = rooms.get(roomCode);
+  if (!room) return null;
+
+  const hasAdmittedKnock = [...room.knocks.values()].some(
+    (k) => k.participantId === participantId && k.status === "admitted"
+  );
+  const allowed =
+    (role === "doctor" && participantId === room.doctorParticipantId) ||
+    (role === "patient" && hasAdmittedKnock);
+  if (!allowed) return null;
+
+  room.participants.add(participantId);
+  return room;
+}
+
+wss.on("connection", (ws, req) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const roomCode = normalizeRoomCode(url.searchParams.get("roomCode"));
+    const participantId = url.searchParams.get("participantId");
+    const role = url.searchParams.get("role");
+
+    if (!roomCode || !participantId || (role !== "doctor" && role !== "patient")) {
+      ws.close(1008, "Invalid websocket params");
+      return;
+    }
+
+    const room = attachParticipantToRoom({ participantId, roomCode, role });
+    if (!room) {
+      ws.close(1008, "Not admitted to room");
+      return;
+    }
+
+    socketsByParticipant.set(participantId, ws);
+    roomByParticipant.set(participantId, roomCode);
+
+    const peers = [...room.participants].filter((id) => id !== participantId);
+    safeSend(ws, { type: "peers", peers });
+    broadcastToRoom(roomCode, { type: "peer-joined", peerId: participantId }, participantId);
+
+    ws.on("message", (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if (msg?.type === "signal" && typeof msg?.to === "string" && msg?.data) {
+        const target = socketsByParticipant.get(msg.to);
+        safeSend(target, {
+          type: "signal",
+          from: participantId,
+          data: msg.data,
+        });
+      }
+    });
+
+    ws.on("close", () => {
+      const rc = roomByParticipant.get(participantId);
+      socketsByParticipant.delete(participantId);
+      roomByParticipant.delete(participantId);
+      const r = rc ? rooms.get(rc) : null;
+      if (r) {
+        r.participants.delete(participantId);
+        broadcastToRoom(rc, { type: "peer-left", peerId: participantId }, participantId);
+      }
+    });
+  } catch {
+    ws.close(1011, "Server error");
+  }
+});
 
 function normalizeRoomCode(raw) {
   if (typeof raw !== "string") return "";
@@ -86,69 +178,28 @@ async function summarizeTranscriptWithOpenAI(transcriptText) {
   return data.choices?.[0]?.message?.content?.trim() || "";
 }
 
-/** Doctor starts a visit: create Chime room and return a shareable meeting ID. */
+/** Doctor starts a visit: create room metadata and return a shareable meeting ID. */
 app.post("/api/meeting", async (req, res) => {
   try {
     let roomCode = makeRoomCode();
     while (rooms.has(roomCode)) {
       roomCode = makeRoomCode();
     }
-
-    const response = await client.send(
-      new CreateMeetingWithAttendeesCommand({
-        ClientRequestToken: randomUUID(),
-        ExternalMeetingId: `visit-${roomCode}`.slice(0, 64),
-        MediaRegion: region,
-        Attendees: [
-          { ExternalUserId: `doctor-${randomUUID()}`.slice(0, 64) },
-        ],
-      })
-    );
-
-    const doctor = response.Attendees[0];
+    const doctorParticipantId = `doctor-${randomUUID()}`;
 
     rooms.set(roomCode, {
-      meeting: response.Meeting,
-      doctor,
+      roomCode,
+      doctorParticipantId,
+      participants: new Set(),
+      knocks: new Map(),
     });
 
     res.json({
       roomCode,
-      meeting: response.Meeting,
-      attendee: doctor,
+      participantId: doctorParticipantId,
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/** Guest joins with the meeting ID the host shared. */
-app.post("/api/meeting/join", async (req, res) => {
-  const raw = req.body?.roomCode;
-  if (typeof raw !== "string" || !raw.trim()) {
-    return res.status(400).json({ error: "Meeting ID is required" });
-  }
-  const roomCode = raw.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-  const room = rooms.get(roomCode);
-  if (!room) {
-    return res.status(404).json({ error: "No meeting found for that ID" });
-  }
-
-  try {
-    const attendeeResp = await client.send(
-      new CreateAttendeeCommand({
-        MeetingId: room.meeting.MeetingId,
-        ExternalUserId: `patient-${randomUUID()}`.slice(0, 64),
-      })
-    );
-    res.json({
-      roomCode,
-      meeting: room.meeting,
-      attendee: attendeeResp.Attendee,
-    });
-  } catch (error) {
-    console.error("join attendee creation failed:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -231,27 +282,12 @@ app.post("/api/meeting/knock", async (req, res) => {
     return res.status(404).json({ error: "No meeting found for that ID" });
   }
 
-  try {
-    // Create a unique attendee for this patient so multiple patients (or
-    // rejoins) never collide with AudioJoinedFromAnotherDevice.
-    const attendeeResp = await client.send(
-      new CreateAttendeeCommand({
-        MeetingId: room.meeting.MeetingId,
-        ExternalUserId: `patient-${randomUUID()}`.slice(0, 64),
-      })
-    );
-
-    const knockId = randomUUID();
-    const entry = { knockId, roomCode, status: "pending", attendee: attendeeResp.Attendee };
-    knocks.set(knockId, entry);
-    if (!room.knocks) room.knocks = new Map();
-    room.knocks.set(knockId, entry);
-
-    res.json({ knockId });
-  } catch (error) {
-    console.error("knock attendee creation failed:", error);
-    res.status(500).json({ error: error.message });
-  }
+  const knockId = randomUUID();
+  const participantId = `patient-${randomUUID()}`;
+  const entry = { knockId, roomCode, status: "pending", participantId };
+  knocks.set(knockId, entry);
+  room.knocks.set(knockId, entry);
+  res.json({ knockId });
 });
 
 /** Patient polls this to find out if they have been admitted or denied. */
@@ -260,12 +296,9 @@ app.get("/api/meeting/knock/:knockId", (req, res) => {
   if (!entry) return res.status(404).json({ error: "Knock not found" });
 
   if (entry.status === "admitted") {
-    const room = rooms.get(entry.roomCode);
-    if (!room) return res.status(404).json({ error: "Meeting has ended" });
     return res.json({
       status: "admitted",
-      meeting: room.meeting,
-      attendee: entry.attendee,
+      participantId: entry.participantId,
       roomCode: entry.roomCode,
     });
   }
@@ -310,6 +343,6 @@ app.post("/api/meeting/:roomCode/deny/:knockId", (req, res) => {
   res.json({ ok: true });
 });
 
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });

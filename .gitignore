@@ -1,0 +1,11 @@
+# Accidental root installs; use client/ and server/ for npm
+node_modules/
+
+# Local editor / OS
+.vscode/
+.idea
+.DS_Store
+
+# Env
+.env
+.env.*.local
