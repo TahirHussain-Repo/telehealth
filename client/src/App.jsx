@@ -775,9 +775,12 @@ export default function App() {
     localCallStreamRef.current = local;
     setMicMuted(meta.initialMuted);
 
-    const base = API_URL || window.location.origin;
-    const wsUrl = new URL(base);
+    const wsBase = import.meta.env.VITE_WS_URL || API_URL || window.location.origin;
+    const wsUrl = new URL(wsBase);
     wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
+    if (!wsUrl.pathname || wsUrl.pathname === "/") {
+      wsUrl.pathname = "/ws";
+    }
     wsUrl.searchParams.set("roomCode", meta.roomCode);
     wsUrl.searchParams.set("participantId", meta.participantId);
     wsUrl.searchParams.set("role", meta.role);
