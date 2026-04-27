@@ -3,10 +3,12 @@ import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import "./App.css";
 
+// REST + WebSocket signaling share this base. In production, set VITE_API_URL at
+// build time if the API runs on a different host/port than the static site
+// (e.g. http://54.221.8.195:4000); otherwise same-origin "" is used.
 const API_URL =
-  import.meta.env.MODE === "development"
-    ? import.meta.env.VITE_API_URL || "http://localhost:4000"
-    : "";
+  (typeof import.meta.env.VITE_API_URL === "string" && import.meta.env.VITE_API_URL.trim()) ||
+  (import.meta.env.MODE === "development" ? "http://localhost:4000" : "");
 
 const FFMPEG_CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
 
@@ -775,12 +777,9 @@ export default function App() {
     localCallStreamRef.current = local;
     setMicMuted(meta.initialMuted);
 
-    const wsBase = import.meta.env.VITE_WS_URL || API_URL || window.location.origin;
-    const wsUrl = new URL(wsBase);
+    const base = API_URL || window.location.origin;
+    const wsUrl = new URL(base);
     wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-    if (!wsUrl.pathname || wsUrl.pathname === "/") {
-      wsUrl.pathname = "/ws";
-    }
     wsUrl.searchParams.set("roomCode", meta.roomCode);
     wsUrl.searchParams.set("participantId", meta.participantId);
     wsUrl.searchParams.set("role", meta.role);

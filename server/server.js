@@ -13,7 +13,7 @@ app.use(express.json());
 
 const port = process.env.PORT || 4000;
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ server });
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
